@@ -38,35 +38,6 @@ struct heuristic_functor {
     }
 };
 
-/*
-__global__
-void expand(
-        const States states,
-        Node* expanded_nodes,
-        Value* expanded_steps) {
-    auto index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= states.size) return;
-
-    Node current_node = states.nodes[index];
-    Value current_step = states.steps[index];
-
-    Node mask = 0xf;
-    int x = -1, y = -1;
-    for (int i = 0; i < 16; ++i, mask <<= 4) {
-        if ((current_node & mask) == 0) {
-            x = i / 4;
-            y = i % 4;
-            break;
-        }
-    }
-
-    if (x > 0) {
-        auto sel = current_node & (mask >> 16);
-        Node next_node = (current_node | (sel << 16)) ^ sel;
-    }
-}
- */
-
 template<class T>
 auto make_expand_input(const thrust::device_vector<T>& vec, size_t stride, size_t x) {
     using namespace thrust::placeholders;
@@ -131,6 +102,15 @@ struct expand_functor {
     }
 };
 
+struct node_comp {
+    __host__ __device__
+    bool operator()(const Node& lhs, const Node& rhs) {
+        if (lhs == empty_node) return false;
+        if (rhs == empty_node) return true;
+        return lhs < rhs;
+    }
+};
+
 int main() {
     Node target = 0xAECDF941B8527306;
 
@@ -185,6 +165,14 @@ int main() {
                         expanded_steps_end
                 ),
                 thrust::make_zip_function(expand_functor())
+        );
+
+        // Sort and remove empty nodes
+        thrust::sort_by_key(
+                expanded_nodes.begin(),
+                expanded_nodes.begin() + len,
+                expanded_steps.begin(),
+                node_comp()
         );
     }
 
