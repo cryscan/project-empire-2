@@ -1,5 +1,6 @@
 #include <iostream>
 #include <thrust/device_vector.h>
+#include <thrust/find.h>
 #include <thrust/zip_function.h>
 
 using Node = uint64_t;
@@ -118,9 +119,15 @@ int main() {
     thrust::device_vector<Value> steps;
     thrust::device_vector<Value> values;
 
-    nodes.reserve(1024);
-    steps.reserve(1024);
-    values.reserve(1024);
+    thrust::device_vector<Node> merged_nodes;
+    thrust::device_vector<Value> merged_steps;
+
+    nodes.reserve(4096);
+    steps.reserve(4096);
+    values.reserve(4096);
+
+    merged_steps.reserve(4096);
+    merged_steps.reserve(4096);
 
     size_t expand_stride = 1024;
     thrust::device_vector<Node> expanded_nodes(4 * expand_stride, empty_node);
@@ -169,18 +176,41 @@ int main() {
 
         // Sort and remove empty nodes
         thrust::sort_by_key(
-                expanded_nodes.begin(),
-                expanded_nodes.begin() + len,
-                expanded_steps.begin(),
+                expanded_nodes_begin,
+                expanded_nodes_end,
+                expanded_steps_begin,
                 node_comp()
         );
+
+        expanded_nodes_end = thrust::find(
+                expanded_nodes_begin,
+                expanded_nodes_end,
+                empty_node
+        );
+        auto expanded_len = expanded_nodes_end - expanded_nodes_begin;
+
+        merged_nodes.resize(nodes.size() + expanded_len);
+        merged_steps.resize(nodes.size() + expanded_len);
+        thrust::merge_by_key(
+                nodes.begin(),
+                nodes.end(),
+                expanded_nodes_begin,
+                expanded_nodes_end,
+                steps.begin(),
+                expanded_steps_begin,
+                merged_nodes.begin(),
+                merged_steps.begin()
+        );
+
+        thrust::swap(nodes, merged_nodes);
+        thrust::swap(steps, merged_steps);
     }
 
-    std::vector<Node> host_expanded_nodes(4 * expand_stride);
-    std::vector<Value> host_expanded_steps(4 * expand_stride);
+    std::vector<Node> host_nodes(nodes.size());
+    std::vector<Value> host_steps(steps.size());
 
-    thrust::copy(expanded_nodes.begin(), expanded_nodes.end(), host_expanded_nodes.begin());
-    thrust::copy(expanded_steps.begin(), expanded_steps.end(), host_expanded_steps.begin());
+    thrust::copy(nodes.begin(), nodes.end(), host_nodes.begin());
+    thrust::copy(steps.begin(), steps.end(), host_steps.begin());
 
     return 0;
 }
