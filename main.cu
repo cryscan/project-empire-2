@@ -188,6 +188,7 @@ int main() {
     open.push_back(thrust::make_tuple(start, 0, expansion.heuristic(start), NORTH));
     close = open;
 
+    int iterations = 0;
     for (int i = 0;; ++i) {
         auto stride = std::min(expand_stride, open.size());
 
@@ -339,7 +340,8 @@ int main() {
             thrust::swap(open, merge);
         }
 
-        if (thrust::binary_search(open.keys(), open.keys(open.size()), target)) {
+        if (thrust::binary_search(close.keys(), close.keys(open.size()), target)) {
+            iterations = i;
             break;
         }
     }
@@ -356,7 +358,7 @@ int main() {
         auto step = host_close.steps[pos];
         auto score = host_close.scores[pos];
 
-        std::cout << (int)step << ' ' << (int)score << '\n';
+        std::cout << (int) step << ' ' << (int) score << '\n';
         print_node(node);
 
         if (node == start) break;
@@ -387,6 +389,8 @@ int main() {
             node = (node | (selected << 4)) ^ selected;
         }
     }
+
+    std::cout << "Iterations: " << iterations << std::endl;
 
     return 0;
 }
