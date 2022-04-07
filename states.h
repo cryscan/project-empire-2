@@ -103,6 +103,25 @@ namespace empire {
             );
         }
 
+        static auto make_select_iter(
+                const States& control,
+                const States& test,
+                States& output,
+                size_t x = 0
+        ) {
+            return thrust::make_zip_iterator(
+                    control.scores.begin() + x,
+                    test.nodes.begin() + x,
+                    test.steps.begin() + x,
+                    test.scores.begin() + x,
+                    test.parents.begin() + x,
+                    output.nodes.begin() + x,
+                    output.steps.begin() + x,
+                    output.scores.begin() + x,
+                    output.parents.begin() + x
+            );
+        }
+
         void reserve(size_t capacity) {
             nodes.reserve(capacity);
             steps.reserve(capacity);

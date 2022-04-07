@@ -108,11 +108,46 @@ struct NodeComp {
     }
 };
 
-struct NodeReduce {
+struct StateReduce {
     template<typename Tuple>
     __host__ __device__
     Tuple operator()(const Tuple& lhs, const Tuple& rhs) {
         return thrust::get<1>(lhs) < thrust::get<1>(rhs) ? lhs : rhs;
+    }
+};
+
+struct StateSelect {
+    __host__ __device__
+    void operator()(
+            const Value& control_score,
+            const Node& test_node,
+            const Value& test_step,
+            const Value& test_score,
+            const Edge& test_parent,
+            Node& out_node,
+            Value& out_step,
+            Value& out_score,
+            Edge& out_parent
+    ) {
+        // Compare the score of control with test:
+        // If control.score <= test.score, clear the out node
+        // Else copy test state to out.
+        if (control_score > test_score) {
+            out_node = test_node;
+            out_step = test_step;
+            out_score = test_score;
+            out_parent = test_parent;
+        } else {
+            out_node = 0;
+        }
+    }
+};
+
+struct StatePartition {
+    template<typename Tuple>
+    __host__ __device__
+    bool operator()(const Tuple& tuple) {
+        return thrust::get<0>(tuple) != 0;
     }
 };
 
@@ -121,74 +156,179 @@ int main() {
     Node target = 0xAECDF941B8527306;
     Expansion expansion(target);
 
-    States open, merge, expand, dedup;
+    States open, close, merge, expand, dedup, int_close, int_dedup, dif, sel;
     size_t expand_stride = 1024;
 
     open.reserve(4096);
+    close.reserve(4096);
     merge.reserve(4096);
-    expand.resize(expand_stride * 4);
-    dedup.resize(expand_stride * 4);
+
+    expand.resize(expand_stride << 2);
+    dedup.reserve(expand_stride << 2);
+
+    int_close.reserve(expand_stride << 2);
+    int_dedup.reserve(expand_stride << 2);
+    dif.reserve(expand_stride << 2);
+    sel.reserve(expand_stride << 2);
 
     open.push_back(thrust::make_tuple(start, 0, expansion.heuristic(start), NORTH));
+    close = open;
 
     for (int i = 0; i < 10; ++i) {
-        // The open list is assumed to be sorted by score.
         auto stride = std::min(expand_stride, open.size());
-        auto expand_size = stride * 4;
 
-        auto expand_iter = States::make_expand_iter(open, expand, stride);
-        thrust::for_each(
-                States::make_expand_iter(open, expand, stride),
-                States::make_expand_iter(open, expand, stride, expand_size),
-                thrust::make_zip_function(expansion)
-        );
+        {
+            auto expand_size = stride * 4;
 
-        // Sort the expanded list by node
-        thrust::sort_by_key(
-                expand.keys(),
-                expand.keys(expand_size),
-                expand.values(),
-                NodeComp()
-        );
-        // Reduce, first pass
-        thrust::reduce_by_key(
-                expand.keys(),
-                expand.keys(expand_size),
-                expand.values(),
-                dedup.keys(),
-                dedup.values(),
-                thrust::equal_to<Node>(),
-                NodeReduce()
-        );
+            thrust::for_each(
+                    States::make_expand_iter(open, expand, stride),
+                    States::make_expand_iter(open, expand, stride, expand_size),
+                    thrust::make_zip_function(expansion)
+            );
 
-        auto expand_end = thrust::find(dedup.keys(), dedup.keys(expand_size), 0);
-        expand_size = expand_end - dedup.keys();
+            // Sort the expanded list by node.
+            thrust::sort_by_key(
+                    expand.keys(),
+                    expand.keys(expand_size),
+                    expand.values(),
+                    NodeComp()
+            );
+            // Reduce, first pass.
+            dedup.resize(expand_size);
+            thrust::reduce_by_key(
+                    expand.keys(),
+                    expand.keys(expand_size),
+                    expand.values(),
+                    dedup.keys(),
+                    dedup.values(),
+                    thrust::equal_to<Node>(),
+                    StateReduce()
+            );
+            auto expand_end = thrust::find(dedup.keys(), dedup.keys(expand_size), 0);
+            dedup.resize(expand_end - dedup.keys());
+        }
 
-        // TODO: close list
+        {
+            // Search in close list and compare
+            int_close.resize(dedup.size());
+            int_dedup.resize(dedup.size());
+            dif.resize(dedup.size());
 
-        // Sort the expanded list by score and merge with open list
-        thrust::sort_by_key(
-                dedup.keys_score(),
-                dedup.keys_score(expand_size),
-                dedup.values_score()
-        );
+            // Search in close list to get intersections
+            auto ends = thrust::set_intersection_by_key(
+                    close.keys(),
+                    close.keys(close.size()),
+                    dedup.keys(),
+                    dedup.keys(dedup.size()),
+                    close.values(),
+                    int_close.keys(),
+                    int_close.values()
+            );
+            int_close.resize(ends.first - int_close.keys());
 
-        merge.resize(open.size() - stride + expand_size);
-        thrust::merge_by_key(
-                open.keys_score(stride),
-                open.keys_score(open.size()),
-                dedup.keys_score(),
-                dedup.keys_score(expand_size),
-                open.values_score(stride),
-                dedup.values_score(),
-                merge.keys_score(),
-                merge.values_score()
-        );
-        thrust::swap(open, merge);
+            ends = thrust::set_intersection_by_key(
+                    dedup.keys(),
+                    dedup.keys(dedup.size()),
+                    int_close.keys(),
+                    int_close.keys(int_close.size()),
+                    dedup.values(),
+                    int_dedup.keys(),
+                    int_dedup.values()
+            );
+            int_dedup.resize(ends.first - int_dedup.keys());
+
+            // Get new states that are in dedup but not in close list
+            ends = thrust::set_difference_by_key(
+                    dedup.keys(),
+                    dedup.keys(dedup.size()),
+                    int_close.keys(),
+                    int_close.keys(int_close.size()),
+                    dedup.values(),
+                    int_close.values(),
+                    dif.keys(),
+                    dif.values()
+            );
+            dif.resize(ends.first - dif.keys());
+        }
+        {
+            // Filter useless states.
+            auto len = int_close.size();
+            sel.resize(len);
+            thrust::for_each(States::make_select_iter(int_close, int_dedup, sel),
+                             States::make_select_iter(int_close, int_dedup, sel, len),
+                             thrust::make_zip_function(StateSelect())
+            );
+            auto ends = thrust::stable_partition(sel.iter(), sel.iter(len), StatePartition());
+            sel.resize(ends - sel.iter());
+
+            // Concat intersection with difference.
+            dedup.resize(sel.size() + dif.size());
+            thrust::merge_by_key(
+                    sel.keys(),
+                    sel.keys(sel.size()),
+                    dif.keys(),
+                    dif.keys(dif.size()),
+                    sel.values(),
+                    dif.values(),
+                    dedup.keys(),
+                    dedup.values()
+            );
+        }
+
+        {
+            // Update close list.
+            // Close list is assumed to be sorted by node.
+            merge.resize(close.size() + dedup.size());
+            thrust::merge_by_key(
+                    close.keys(),
+                    close.keys(close.size()),
+                    dedup.keys(),
+                    dedup.keys(dedup.size()),
+                    close.values(),
+                    dedup.values(),
+                    merge.keys(),
+                    merge.values()
+            );
+            close.resize(merge.size());
+            auto ends = thrust::reduce_by_key(
+                    merge.keys(),
+                    merge.keys(merge.size()),
+                    merge.values(),
+                    close.keys(),
+                    close.values(),
+                    thrust::equal_to<Node>(),
+                    StateReduce()
+            );
+            close.resize(ends.first - close.keys());
+        }
+
+        {
+            // The open list is assumed to be sorted by score.
+            // Sort the expanded list by score and merge with open list.
+            thrust::sort_by_key(
+                    dedup.keys_score(),
+                    dedup.keys_score(dedup.size()),
+                    dedup.values_score()
+            );
+
+            merge.resize(open.size() - stride + dedup.size());
+            thrust::merge_by_key(
+                    open.keys_score(stride),
+                    open.keys_score(open.size()),
+                    dedup.keys_score(),
+                    dedup.keys_score(dedup.size()),
+                    open.values_score(stride),
+                    dedup.values_score(),
+                    merge.keys_score(),
+                    merge.values_score()
+            );
+            thrust::swap(open, merge);
+        }
     }
 
-    HostStates host;
-    host.copy_from(open);
+    HostStates host_open, host_close;
+    host_open.copy_from(open);
+    host_close.copy_from(close);
 
     return 0;
 }
