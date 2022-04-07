@@ -4,6 +4,7 @@
 
 #include <thrust/find.h>
 #include <thrust/zip_function.h>
+#include <thrust/binary_search.h>
 
 #include "states.h"
 
@@ -151,6 +152,19 @@ struct StatePartition {
     }
 };
 
+void print_node(Node node) {
+    Node mask = 0xf;
+    for (auto i = 0u; i < 4; ++i) {
+        for (auto j = 0u; j < 4; ++j) {
+            auto n = (mask & node) >> ((4 * i + j) * 4);
+            std::cout << n << '\t';
+            mask <<= 4;
+        }
+        std::cout << '\n';
+    }
+    std::cout << std::endl;
+}
+
 int main() {
     Node start = 0xFEDCBA9876543210;
     Node target = 0xAECDF941B8527306;
@@ -174,7 +188,7 @@ int main() {
     open.push_back(thrust::make_tuple(start, 0, expansion.heuristic(start), NORTH));
     close = open;
 
-    for (int i = 0; i < 10; ++i) {
+    for (int i = 0;; ++i) {
         auto stride = std::min(expand_stride, open.size());
 
         {
@@ -324,11 +338,55 @@ int main() {
             );
             thrust::swap(open, merge);
         }
+
+        if (thrust::binary_search(open.keys(), open.keys(open.size()), target)) {
+            break;
+        }
     }
 
     HostStates host_open, host_close;
     host_open.copy_from(open);
     host_close.copy_from(close);
+
+    Node node = target;
+    while (true) {
+        auto iter = std::lower_bound(host_close.nodes.begin(), host_close.nodes.end(), node);
+        auto pos = iter - host_close.nodes.begin();
+        auto parent = host_close.parents[pos];
+        auto step = host_close.steps[pos];
+        auto score = host_close.scores[pos];
+
+        std::cout << (int)step << ' ' << (int)score << '\n';
+        print_node(node);
+
+        if (node == start) break;
+
+        Node mask = 0xf;
+        int x = -1, y = -1;
+        for (int i = 0; i < 16; ++i, mask <<= 4) {
+            if ((node & mask) == 0) {
+                x = i / 4;
+                y = i % 4;
+                break;
+            }
+        }
+        if (parent == NORTH && x > 0) {
+            auto selected = node & (mask >> 16);
+            node = (node | (selected << 16)) ^ selected;
+        }
+        if (parent == EAST && y < 3) {
+            auto selected = node & (mask << 4);
+            node = (node | (selected >> 4)) ^ selected;
+        }
+        if (parent == SOUTH && x < 3) {
+            auto selected = node & (mask << 16);
+            node = (node | (selected >> 16)) ^ selected;
+        }
+        if (parent == WEST && y > 0) {
+            auto selected = node & (mask >> 4);
+            node = (node | (selected << 4)) ^ selected;
+        }
+    }
 
     return 0;
 }
