@@ -1,44 +1,32 @@
-#include <iostream>
-#include <thrust/device_vector.h>
+//
+// Created by lepet on 4/6/2022.
+//
+
 #include <thrust/find.h>
 #include <thrust/zip_function.h>
 
+#include "states.h"
+
 using Node = uint64_t;
 using Value = uint8_t;
-
-constexpr Node empty_node = 0;
-enum Direction {
-    UP = 0,
-    RIGHT = 1,
-    DOWN = 2,
-    LEFT = 3,
+enum Edge : uint8_t {
+    NORTH = 0,
+    EAST = 1,
+    SOUTH = 2,
+    WEST = 3,
 };
 
-template<class T>
-auto make_expand_input(const thrust::device_vector<T>& vec, size_t stride, size_t x) {
-    using namespace thrust::placeholders;
-    auto counter = thrust::make_counting_iterator(x);
-    auto iter = thrust::make_permutation_iterator(
-            vec.begin(),
-            thrust::make_transform_iterator(counter, _1 % stride)
-    );
-    return iter;
-}
+using States = empire::States<Node, Edge, Value>;
+using HostStates = empire::HostStates<Node, Edge, Value>;
 
-auto make_expand_direction_input(size_t stride, size_t x) {
-    using namespace thrust::placeholders;
-    auto counter = thrust::make_counting_iterator(x);
-    auto direction_iter = thrust::make_transform_iterator(counter, _1 / stride);
-    return direction_iter;
-}
-
-struct expand_functor {
+struct Expansion {
     Node target;
 
-    explicit expand_functor(Node target) : target(target) {}
+    explicit Expansion(Node target) : target(target) {}
 
     // Heuristic
-    [[nodiscard]] __host__ __device__
+    [[nodiscard]]
+    __host__ __device__
     Value heuristic(Node node) const {
         Node mask = 0xf;
         Value result = 0;
@@ -56,9 +44,10 @@ struct expand_functor {
             const Node& node,
             const Value& step,
             const size_t& direction,
-            Node& expanded_node,
-            Value& expanded_step,
-            Value& expanded_score
+            Node& out_node,
+            Value& out_step,
+            Value& out_score,
+            Edge& out_parent
     ) const {
         Node mask = 0xf;
         int x = -1, y = -1;
@@ -70,172 +59,136 @@ struct expand_functor {
             }
         }
 
-        if (direction == UP && x > 0) {
+        if (direction == NORTH && x > 0) {
             auto selected = node & (mask >> 16);
-            expanded_node = (node | (selected << 16)) ^ selected;
-            expanded_step = step + 1;
-            expanded_score = expanded_step + heuristic(node);
+            out_node = (node | (selected << 16)) ^ selected;
+            out_step = step + 1;
+            out_score = out_step + heuristic(node);
+            out_parent = SOUTH;
             return;
         }
 
-        if (direction == RIGHT && y < 3) {
+        if (direction == EAST && y < 3) {
             auto selected = node & (mask << 4);
-            expanded_node = (node | (selected >> 4)) ^ selected;
-            expanded_step = step + 1;
-            expanded_score = expanded_step + heuristic(node);
+            out_node = (node | (selected >> 4)) ^ selected;
+            out_step = step + 1;
+            out_score = out_step + heuristic(node);
+            out_parent = WEST;
             return;
         }
 
-        if (direction == DOWN && x < 3) {
+        if (direction == SOUTH && x < 3) {
             auto selected = node & (mask << 16);
-            expanded_node = (node | (selected >> 16)) ^ selected;
-            expanded_step = step + 1;
-            expanded_score = expanded_step + heuristic(node);
+            out_node = (node | (selected >> 16)) ^ selected;
+            out_step = step + 1;
+            out_score = out_step + heuristic(node);
+            out_parent = NORTH;
             return;
         }
 
-        if (direction == LEFT && y > 0) {
+        if (direction == WEST && y > 0) {
             auto selected = node & (mask >> 4);
-            expanded_node = (node | (selected << 4)) ^ selected;
-            expanded_step = step + 1;
-            expanded_score = expanded_step + heuristic(node);
+            out_node = (node | (selected << 4)) ^ selected;
+            out_step = step + 1;
+            out_score = out_step + heuristic(node);
+            out_parent = EAST;
             return;
         }
 
-        expanded_node = empty_node;
+        out_node = 0;
     }
 };
 
-struct node_comp {
+struct NodeComp {
     __host__ __device__
     bool operator()(const Node& lhs, const Node& rhs) {
-        if (lhs == empty_node) return false;
-        if (rhs == empty_node) return true;
+        if (lhs == 0) return false;
+        if (rhs == 0) return true;
         return lhs < rhs;
+    }
+};
+
+struct NodeReduce {
+    template<typename Tuple>
+    __host__ __device__
+    Tuple operator()(const Tuple& lhs, const Tuple& rhs) {
+        return thrust::get<1>(lhs) < thrust::get<1>(rhs) ? lhs : rhs;
     }
 };
 
 int main() {
     Node start = 0xFEDCBA9876543210;
     Node target = 0xAECDF941B8527306;
+    Expansion expansion(target);
 
-    thrust::device_vector<Node> nodes;
-    thrust::device_vector<Value> steps;
-    thrust::device_vector<Value> scores;
-
-    thrust::device_vector<Node> merged_nodes;
-    thrust::device_vector<Value> merged_steps;
-    thrust::device_vector<Value> merged_scores;
-
-    nodes.reserve(4096);
-    steps.reserve(4096);
-    scores.reserve(4096);
-
-    merged_steps.reserve(4096);
-    merged_steps.reserve(4096);
-
+    States open, merge, expand, dedup;
     size_t expand_stride = 1024;
-    thrust::device_vector<Node> expanded_nodes(4 * expand_stride, empty_node);
-    thrust::device_vector<Value> expanded_steps(4 * expand_stride);
-    thrust::device_vector<Value> expanded_scores(4 * expand_stride);
-    auto expand_func = expand_functor(target);
 
-    nodes.push_back(start);
-    steps.push_back(0);
-    scores.push_back(expand_func.heuristic(start));
+    open.reserve(4096);
+    merge.reserve(4096);
+    expand.resize(expand_stride * 4);
+    dedup.resize(expand_stride * 4);
 
-    {
-        auto stride = std::min(expand_stride, nodes.size());
-        auto len = 4 * stride;
+    open.push_back(thrust::make_tuple(start, 0, expansion.heuristic(start), NORTH));
 
-        auto nodes_begin = make_expand_input(nodes, stride, 0);
-        auto nodes_end = make_expand_input(nodes, stride, len);
+    for (int i = 0; i < 10; ++i) {
+        // The open list is assumed to be sorted by score.
+        auto stride = std::min(expand_stride, open.size());
+        auto expand_size = stride * 4;
 
-        auto steps_begin = make_expand_input(steps, stride, 0);
-        auto steps_end = make_expand_input(steps, stride, len);
-
-        auto direction_begin = make_expand_direction_input(stride, 0);
-        auto direction_end = make_expand_direction_input(stride, len);
-
-        auto expanded_nodes_begin = expanded_nodes.begin();
-        auto expanded_nodes_end = expanded_nodes_begin + len;
-
-        auto expanded_steps_begin = expanded_steps.begin();
-        auto expanded_steps_end = expanded_steps_begin + len;
-
-        auto expanded_scores_begin = expanded_scores.begin();
-        auto expanded_scores_end = expanded_scores_begin + len;
-
+        auto expand_iter = States::make_expand_iter(open, expand, stride);
         thrust::for_each(
-                thrust::make_zip_iterator(
-                        nodes_begin,
-                        steps_begin,
-                        direction_begin,
-                        expanded_nodes_begin,
-                        expanded_steps_begin,
-                        expanded_scores_begin
-                ),
-                thrust::make_zip_iterator(
-                        nodes_end,
-                        steps_end,
-                        direction_end,
-                        expanded_nodes_end,
-                        expanded_steps_end,
-                        expanded_scores_end
-                ),
-                thrust::make_zip_function(expand_func)
+                States::make_expand_iter(open, expand, stride),
+                States::make_expand_iter(open, expand, stride, expand_size),
+                thrust::make_zip_function(expansion)
         );
 
-        // Sort and remove empty expanded nodes
-        auto expanded_values_begin = thrust::make_zip_iterator(expanded_steps_begin, expanded_scores_begin);
+        // Sort the expanded list by node
         thrust::sort_by_key(
-                expanded_nodes_begin,
-                expanded_nodes_end,
-                expanded_values_begin,
-                node_comp()
+                expand.keys(),
+                expand.keys(expand_size),
+                expand.values(),
+                NodeComp()
+        );
+        // Reduce, first pass
+        thrust::reduce_by_key(
+                expand.keys(),
+                expand.keys(expand_size),
+                expand.values(),
+                dedup.keys(),
+                dedup.values(),
+                thrust::equal_to<Node>(),
+                NodeReduce()
         );
 
-        expanded_nodes_end = thrust::find(
-                expanded_nodes_begin,
-                expanded_nodes_end,
-                empty_node
-        );
-        auto expanded_len = expanded_nodes_end - expanded_nodes_begin;
+        auto expand_end = thrust::find(dedup.keys(), dedup.keys(expand_size), 0);
+        expand_size = expand_end - dedup.keys();
 
-        // TODO: remove duplications
+        // TODO: close list
 
-        // Merge expanded states with remaining open list states
-        merged_nodes.resize(nodes.size() - stride + expanded_len);
-        merged_steps.resize(nodes.size() - stride + expanded_len);
-        merged_scores.resize(nodes.size() - stride + expanded_len);
-        auto original_values_begin = thrust::make_zip_iterator(
-                steps.begin() + stride,
-                scores.begin() + stride
+        // Sort the expanded list by score and merge with open list
+        thrust::sort_by_key(
+                dedup.keys_score(),
+                dedup.keys_score(expand_size),
+                dedup.values_score()
         );
-        auto merged_values_begin = thrust::make_zip_iterator(merged_steps.begin(), merged_scores.begin());
+
+        merge.resize(open.size() - stride + expand_size);
         thrust::merge_by_key(
-                nodes.begin() + stride,
-                nodes.end(),
-                expanded_nodes_begin,
-                expanded_nodes_end,
-                original_values_begin,
-                expanded_values_begin,
-                merged_nodes.begin(),
-                merged_values_begin
+                open.keys_score(stride),
+                open.keys_score(open.size()),
+                dedup.keys_score(),
+                dedup.keys_score(expand_size),
+                open.values_score(stride),
+                dedup.values_score(),
+                merge.keys_score(),
+                merge.values_score()
         );
-
-        thrust::swap(nodes, merged_nodes);
-        thrust::swap(steps, merged_steps);
-        thrust::swap(scores, merged_scores);
+        thrust::swap(open, merge);
     }
 
-    std::vector<Node> host_nodes(nodes.size());
-    std::vector<Value> host_steps(steps.size());
-    std::vector<Value> host_scores(scores.size());
-
-    thrust::copy(nodes.begin(), nodes.end(), host_nodes.begin());
-    thrust::copy(steps.begin(), steps.end(), host_steps.begin());
-    thrust::copy(scores.begin(), scores.end(), host_scores.begin());
+    HostStates host;
+    host.copy_from(open);
 
     return 0;
 }
