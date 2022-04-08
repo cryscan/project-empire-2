@@ -121,27 +121,6 @@ struct StateReduce {
     }
 };
 
-struct StateSelect {
-    __host__ __device__
-    void operator()(
-            const Node& control_node,
-            const Value& control_score,
-            const Value& test_score,
-            Node& out_node
-    ) {
-        if (control_node == out_node && control_score <= test_score)
-            out_node = 0;
-    }
-};
-
-struct StateRemove {
-    template<typename Tuple>
-    __host__ __device__
-    bool operator()(const Tuple& tuple) {
-        return thrust::get<0>(tuple) == 0;
-    }
-};
-
 auto make_expand_iter(const States& input, States& output, size_t stride, size_t x = 0) {
     using namespace thrust::placeholders;
     auto expand_counter = thrust::make_counting_iterator(x);
@@ -161,21 +140,6 @@ auto make_expand_iter(const States& input, States& output, size_t stride, size_t
             output.steps.begin() + x,
             output.scores.begin() + x,
             output.parents.begin() + x
-    );
-}
-
-auto make_selection_iter(
-        const thrust::device_vector<Node>& indices,
-        const States& close,
-        States& dedup,
-        size_t x = 0
-) {
-    auto indices_iter = indices.begin() + x;
-    return thrust::make_zip_iterator(
-            thrust::make_permutation_iterator(close.keys(), indices_iter),
-            thrust::make_permutation_iterator(close.keys_score(), indices_iter),
-            dedup.keys_score(x),
-            dedup.keys(x)
     );
 }
 
@@ -300,27 +264,6 @@ int main() {
 
         tic = std::chrono::high_resolution_clock::now();
         {
-            /*
-            // Search in close list
-            indices.resize(dedup.size());
-            thrust::lower_bound(
-                    close.keys(),
-                    close.keys(close.size()),
-                    dedup.keys(),
-                    dedup.keys(dedup.size()),
-                    indices.begin()
-            );
-
-            // Exclude suboptimal states
-            thrust::for_each(
-                    make_selection_iter(indices, close, dedup),
-                    make_selection_iter(indices, close, dedup, dedup.size()),
-                    thrust::make_zip_function(StateSelect())
-            );
-            auto end = thrust::remove_if(dedup.iter(), dedup.iter(dedup.size()), StateRemove());
-            dedup.resize(end - dedup.iter());
-             */
-
             // Reduce, first pass.
             dedup.resize(expand_size);
             thrust::reduce_by_key(
@@ -344,32 +287,6 @@ int main() {
 
         tic = std::chrono::high_resolution_clock::now();
         {
-            /*
-            // Close list is assumed to be sorted by node.
-            merge.resize(close.size() + dedup.size());
-            thrust::merge_by_key(
-                    close.keys(),
-                    close.keys(close.size()),
-                    dedup.keys(),
-                    dedup.keys(dedup.size()),
-                    close.values(),
-                    dedup.values(),
-                    merge.keys(),
-                    merge.values()
-            );
-            close.resize(merge.size());
-            auto ends = thrust::reduce_by_key(
-                    merge.keys(),
-                    merge.keys(merge.size()),
-                    merge.values(),
-                    close.keys(),
-                    close.values(),
-                    thrust::equal_to<Node>(),
-                    StateReduce()
-            );
-            close.resize(ends.first - close.keys());
-             */
-
             // Update hash table
             thrust::for_each(
                     thrust::make_zip_iterator(dedup.nodes.begin(), dedup.scores.begin()),
