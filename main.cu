@@ -2,6 +2,7 @@
 // Created by lepet on 4/6/2022.
 //
 
+#include <thrust/host_vector.h>
 #include <thrust/find.h>
 #include <thrust/zip_function.h>
 #include <thrust/binary_search.h>
@@ -113,13 +114,60 @@ struct NodeComp {
     }
 };
 
+template<size_t INDEX>
 struct StateReduce {
     template<typename Tuple>
     __host__ __device__
     Tuple operator()(const Tuple& lhs, const Tuple& rhs) {
-        return thrust::get<1>(lhs) < thrust::get<1>(rhs) ? lhs : rhs;
+        return thrust::get<INDEX>(lhs) < thrust::get<INDEX>(rhs) ? lhs : rhs;
     }
 };
+
+template<size_t INDEX>
+struct StateRemove {
+    template<typename Tuple>
+    __host__ __device__
+    bool operator()(const Tuple& tuple) {
+        return thrust::get<INDEX>(tuple) == 0;
+    }
+};
+
+template<size_t INDEX>
+struct StatePartition {
+    template<typename Tuple>
+    __host__ __device__
+    bool operator()(const Tuple& tuple) {
+        return thrust::get<INDEX>(tuple) != 0;
+    }
+};
+
+auto make_extract_keys(size_t input_size, size_t stride, size_t x = 0) {
+    using namespace thrust::placeholders;
+    size_t len = std::ceil((static_cast<double>(input_size)) / stride);
+    auto counter = thrust::make_counting_iterator(x);
+    return thrust::make_transform_iterator(counter, _1 / len);
+}
+
+auto make_extract_values(States& states, size_t x = 0) {
+    auto counter = thrust::make_counting_iterator(x);
+    return thrust::make_zip_iterator(
+            counter,
+            states.nodes.begin() + x,
+            states.steps.begin() + x,
+            states.scores.begin() + x,
+            states.parents.begin() + x
+    );
+}
+
+auto make_extract_values_indices(States& states, thrust::device_vector<int>& indices, size_t x = 0) {
+    return thrust::make_zip_iterator(
+            indices.begin() + x,
+            states.nodes.begin() + x,
+            states.steps.begin() + x,
+            states.scores.begin() + x,
+            states.parents.begin() + x
+    );
+}
 
 auto make_expand_iter(const States& input, States& output, size_t stride, size_t x = 0) {
     using namespace thrust::placeholders;
@@ -164,6 +212,7 @@ struct HashStateRemove {
     __host__ __device__
     bool operator()(const Tuple& tuple) {
         Node node = thrust::get<0>(tuple);
+        if (node == 0) return true;
 
         auto signature = hash(node);
         auto key = signature % size;
@@ -213,6 +262,7 @@ int main() {
     Expansion expansion(target);
 
     std::chrono::high_resolution_clock::duration
+            extract_duration(0),
             expand_duration(0),
             dedup_duration(0),
             close_duration(0),
@@ -222,15 +272,16 @@ int main() {
     HashStateRemove hash_state_remove(thrust::raw_pointer_cast(hashtable.data()), hashtable.size());
     HashInsert hash_insert(thrust::raw_pointer_cast(hashtable.data()), hashtable.size());
 
-    States open, merge, expand, dedup;
+    States open, extract, expand, dedup;
     // thrust::device_vector<Node> indices;
 
     size_t expand_stride = 1024;
 
     open.reserve(4096);
     // close.reserve(4096);
-    merge.reserve(4096);
+    // merge.reserve(4096);
 
+    extract.resize(expand_stride);
     expand.resize(expand_stride << 2);
     dedup.reserve(expand_stride << 2);
     // indices.reserve(expand_stride << 2);
@@ -241,46 +292,85 @@ int main() {
     int iterations;
     for (iterations = 0;; ++iterations) {
         auto stride = std::min(expand_stride, open.size());
-        auto expand_size = stride * 4;
 
         auto tic = std::chrono::high_resolution_clock::now();
         {
-            thrust::for_each(
-                    make_expand_iter(open, expand, stride),
-                    make_expand_iter(open, expand, stride, expand_size),
-                    thrust::make_zip_function(expansion)
-            );
+            // Extract.
+            if (open.size() > expand_stride) {
+                thrust::device_vector<int> keys(stride);
+                thrust::device_vector<int> indices(stride);
+                thrust::reduce_by_key(
+                        make_extract_keys(open.size(), stride),
+                        make_extract_keys(open.size(), stride, open.size()),
+                        make_extract_values(open),
+                        keys.begin(),
+                        make_extract_values_indices(extract, indices),
+                        thrust::equal_to<int>(),
+                        StateReduce<3>()
+                );
 
-            // Sort the expanded list by node.
-            thrust::sort_by_key(
-                    expand.keys(),
-                    expand.keys(expand_size),
-                    expand.values(),
-                    NodeComp()
-            );
+                // Remove extracted states from open list.
+                using namespace thrust::placeholders;
+                thrust::transform(
+                        thrust::make_permutation_iterator(open.nodes.begin(), indices.begin()),
+                        thrust::make_permutation_iterator(open.nodes.begin(), indices.end()),
+                        thrust::make_permutation_iterator(open.nodes.begin(), indices.begin()),
+                        _1 ^ _1
+                );
+
+                auto end = thrust::remove_if(open.iter(), open.iter(open.size()), StateRemove<0>());
+                // auto end = thrust::partition(open.iter(), open.iter(open.size()), StatePartition<0>());
+                open.resize(end - open.iter());
+            } else {
+                extract = open;
+                open.resize(0);
+            }
         }
         auto toc = std::chrono::high_resolution_clock::now();
+        extract_duration += toc - tic;
+
+        tic = std::chrono::high_resolution_clock::now();
+        {
+            // Expand.
+            expand.resize(stride << 2);
+            thrust::for_each(
+                    make_expand_iter(extract, expand, stride),
+                    make_expand_iter(extract, expand, stride, expand.size()),
+                    thrust::make_zip_function(expansion)
+            );
+        }
+        toc = std::chrono::high_resolution_clock::now();
         expand_duration += toc - tic;
 
         tic = std::chrono::high_resolution_clock::now();
         {
-            // Reduce, first pass.
-            dedup.resize(expand_size);
-            thrust::reduce_by_key(
+            // Remove suboptimal and empty states.
+            auto end = thrust::remove_if(
+                    expand.iter(),
+                    expand.iter(expand.size()),
+                    hash_state_remove
+            );
+            expand.resize(end - expand.iter());
+
+            // Sort the expanded list by node.
+            thrust::sort_by_key(
                     expand.keys(),
-                    expand.keys(expand_size),
+                    expand.keys(expand.size()),
+                    expand.values()
+            );
+
+            // Deduplication.
+            dedup.resize(expand.size());
+            auto dedup_end = thrust::reduce_by_key(
+                    expand.keys(),
+                    expand.keys(expand.size()),
                     expand.values(),
                     dedup.keys(),
                     dedup.values(),
                     thrust::equal_to<Node>(),
-                    StateReduce()
+                    StateReduce<1>()
             );
-            auto expand_end = thrust::find(dedup.keys(), dedup.keys(expand_size), 0);
-            dedup.resize(expand_end - dedup.keys());
-
-            // Remove suboptimal states.
-            auto end = thrust::remove_if(dedup.iter(), dedup.iter(dedup.size()), hash_state_remove);
-            dedup.resize(end - dedup.iter());
+            dedup.resize(dedup_end.first - dedup.keys());
         }
         toc = std::chrono::high_resolution_clock::now();
         dedup_duration += toc - tic;
@@ -303,26 +393,9 @@ int main() {
 
         tic = std::chrono::high_resolution_clock::now();
         {
-            // The open list is assumed to be sorted by score.
-            // Sort the expanded list by score and merge with open list.
-            thrust::sort_by_key(
-                    dedup.keys_score(),
-                    dedup.keys_score(dedup.size()),
-                    dedup.values_score()
-            );
-
-            merge.resize(open.size() - stride + dedup.size());
-            thrust::merge_by_key(
-                    open.keys_score(stride),
-                    open.keys_score(open.size()),
-                    dedup.keys_score(),
-                    dedup.keys_score(dedup.size()),
-                    open.values_score(stride),
-                    dedup.values_score(),
-                    merge.keys_score(),
-                    merge.values_score()
-            );
-            thrust::swap(open, merge);
+            auto size = open.size();
+            open.resize(size + dedup.size());
+            thrust::copy(dedup.iter(), dedup.iter(dedup.size()), open.iter(size));
         }
         toc = std::chrono::high_resolution_clock::now();
         open_duration += toc - tic;
@@ -377,6 +450,9 @@ int main() {
     }
 
     std::cout << "Iterations: " << iterations << std::endl;
+    std::cout << "Extract duration: "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(extract_duration).count()
+              << '\n';
     std::cout << "Expand duration: "
               << std::chrono::duration_cast<std::chrono::milliseconds>(expand_duration).count()
               << '\n';
