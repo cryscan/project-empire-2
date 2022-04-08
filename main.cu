@@ -64,7 +64,7 @@ struct Expansion {
             auto selected = node & (mask >> 16);
             out_node = (node | (selected << 16)) ^ selected;
             out_step = step + 1;
-            out_score = out_step + heuristic(node);
+            out_score = step + heuristic(node);
             out_parent = SOUTH;
             return;
         }
@@ -73,7 +73,7 @@ struct Expansion {
             auto selected = node & (mask << 4);
             out_node = (node | (selected >> 4)) ^ selected;
             out_step = step + 1;
-            out_score = out_step + heuristic(node);
+            out_score = step + heuristic(node);
             out_parent = WEST;
             return;
         }
@@ -82,7 +82,7 @@ struct Expansion {
             auto selected = node & (mask << 16);
             out_node = (node | (selected >> 16)) ^ selected;
             out_step = step + 1;
-            out_score = out_step + heuristic(node);
+            out_score = step + heuristic(node);
             out_parent = NORTH;
             return;
         }
@@ -91,7 +91,7 @@ struct Expansion {
             auto selected = node & (mask >> 4);
             out_node = (node | (selected << 4)) ^ selected;
             out_step = step + 1;
-            out_score = out_step + heuristic(node);
+            out_score = step + heuristic(node);
             out_parent = EAST;
             return;
         }
@@ -120,27 +120,13 @@ struct StateReduce {
 struct StateSelect {
     __host__ __device__
     void operator()(
+            const Node& control_node,
             const Value& control_score,
-            const Node& test_node,
-            const Value& test_step,
             const Value& test_score,
-            const Edge& test_parent,
-            Node& out_node,
-            Value& out_step,
-            Value& out_score,
-            Edge& out_parent
+            Node& out_node
     ) {
-        // Compare the score of control with test:
-        // If control.score <= test.score, clear the out node
-        // Else copy test state to out.
-        if (control_score > test_score) {
-            out_node = test_node;
-            out_step = test_step;
-            out_score = test_score;
-            out_parent = test_parent;
-        } else {
+        if (control_node == out_node && control_score <= test_score)
             out_node = 0;
-        }
     }
 };
 
@@ -151,6 +137,41 @@ struct StatePartition {
         return thrust::get<0>(tuple) != 0;
     }
 };
+
+auto make_expand_iter(const States& input, States& output, size_t stride, size_t x = 0) {
+    using namespace thrust::placeholders;
+    auto expand_counter = thrust::make_counting_iterator(x);
+    auto stride_counter = thrust::make_transform_iterator(expand_counter, _1 % stride);
+    auto direction_iter = thrust::make_transform_iterator(expand_counter, _1 / stride);
+
+    auto input_nodes_iter = thrust::make_permutation_iterator(input.nodes.begin(), stride_counter);
+    auto input_steps_iter = thrust::make_permutation_iterator(input.steps.begin(), stride_counter);
+
+    return thrust::make_zip_iterator(
+            input_nodes_iter,
+            input_steps_iter,
+            direction_iter,
+            output.nodes.begin() + x,
+            output.steps.begin() + x,
+            output.scores.begin() + x,
+            output.parents.begin() + x
+    );
+}
+
+auto make_selection_iter(
+        const thrust::device_vector<Node>& indices,
+        const States& close,
+        States& dedup,
+        size_t x = 0
+) {
+    auto indices_iter = indices.begin() + x;
+    return thrust::make_zip_iterator(
+            thrust::make_permutation_iterator(close.keys(), indices_iter),
+            thrust::make_permutation_iterator(close.keys_score(), indices_iter),
+            dedup.keys_score(x),
+            dedup.keys(x)
+    );
+}
 
 void print_node(Node node) {
     Node mask = 0xf;
@@ -170,7 +191,8 @@ int main() {
     Node target = 0xAECDF941B8527306;
     Expansion expansion(target);
 
-    States open, close, merge, expand, dedup, int_close, int_dedup, dif, sel;
+    States open, close, merge, expand, dedup;
+    thrust::device_vector<Node> indices;
     size_t expand_stride = 1024;
 
     open.reserve(4096);
@@ -179,11 +201,7 @@ int main() {
 
     expand.resize(expand_stride << 2);
     dedup.reserve(expand_stride << 2);
-
-    int_close.reserve(expand_stride << 2);
-    int_dedup.reserve(expand_stride << 2);
-    dif.reserve(expand_stride << 2);
-    sel.reserve(expand_stride << 2);
+    indices.reserve(expand_stride << 2);
 
     open.push_back(thrust::make_tuple(start, 0, expansion.heuristic(start), NORTH));
     close = open;
@@ -196,8 +214,8 @@ int main() {
             auto expand_size = stride * 4;
 
             thrust::for_each(
-                    States::make_expand_iter(open, expand, stride),
-                    States::make_expand_iter(open, expand, stride, expand_size),
+                    make_expand_iter(open, expand, stride),
+                    make_expand_iter(open, expand, stride, expand_size),
                     thrust::make_zip_function(expansion)
             );
 
@@ -224,70 +242,24 @@ int main() {
         }
 
         {
-            // Search in close list and compare
-            int_close.resize(dedup.size());
-            int_dedup.resize(dedup.size());
-            dif.resize(dedup.size());
-
-            // Search in close list to get intersections
-            auto ends = thrust::set_intersection_by_key(
+            // Search in close list
+            indices.resize(dedup.size());
+            thrust::lower_bound(
                     close.keys(),
                     close.keys(close.size()),
                     dedup.keys(),
                     dedup.keys(dedup.size()),
-                    close.values(),
-                    int_close.keys(),
-                    int_close.values()
+                    indices.begin()
             );
-            int_close.resize(ends.first - int_close.keys());
 
-            ends = thrust::set_intersection_by_key(
-                    dedup.keys(),
-                    dedup.keys(dedup.size()),
-                    int_close.keys(),
-                    int_close.keys(int_close.size()),
-                    dedup.values(),
-                    int_dedup.keys(),
-                    int_dedup.values()
+            // Exclude suboptimal states
+            thrust::for_each(
+                    make_selection_iter(indices, close, dedup),
+                    make_selection_iter(indices, close, dedup, dedup.size()),
+                    thrust::make_zip_function(StateSelect())
             );
-            int_dedup.resize(ends.first - int_dedup.keys());
-
-            // Get new states that are in dedup but not in close list
-            ends = thrust::set_difference_by_key(
-                    dedup.keys(),
-                    dedup.keys(dedup.size()),
-                    int_close.keys(),
-                    int_close.keys(int_close.size()),
-                    dedup.values(),
-                    int_close.values(),
-                    dif.keys(),
-                    dif.values()
-            );
-            dif.resize(ends.first - dif.keys());
-        }
-        {
-            // Filter useless states.
-            auto len = int_close.size();
-            sel.resize(len);
-            thrust::for_each(States::make_select_iter(int_close, int_dedup, sel),
-                             States::make_select_iter(int_close, int_dedup, sel, len),
-                             thrust::make_zip_function(StateSelect())
-            );
-            auto ends = thrust::stable_partition(sel.iter(), sel.iter(len), StatePartition());
-            sel.resize(ends - sel.iter());
-
-            // Concat intersection with difference.
-            dedup.resize(sel.size() + dif.size());
-            thrust::merge_by_key(
-                    sel.keys(),
-                    sel.keys(sel.size()),
-                    dif.keys(),
-                    dif.keys(dif.size()),
-                    sel.values(),
-                    dif.values(),
-                    dedup.keys(),
-                    dedup.values()
-            );
+            auto end = thrust::stable_partition(dedup.iter(), dedup.iter(dedup.size()), StatePartition());
+            dedup.resize(end - dedup.iter());
         }
 
         {

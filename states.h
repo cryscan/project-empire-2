@@ -12,17 +12,12 @@ namespace empire {
     struct HostStates;
 
     template<typename Node, typename Edge, typename Value>
-    class States {
+    struct States {
         thrust::device_vector<Node> nodes;
         thrust::device_vector<Value> steps;
         thrust::device_vector<Value> scores;
         thrust::device_vector<Edge> parents;
 
-        friend class HostStates<Node, Edge, Value>;
-
-        friend void thrust::swap(States&, States&);
-
-    public:
         [[nodiscard]] size_t size() const { return nodes.size(); }
 
         auto iter(size_t x = 0) const {
@@ -80,45 +75,6 @@ namespace empire {
                     nodes.begin() + x,
                     steps.begin() + x,
                     parents.begin() + x
-            );
-        }
-
-        static auto make_expand_iter(const States& input, States& output, size_t stride, size_t x = 0) {
-            using namespace thrust::placeholders;
-            auto expand_counter = thrust::make_counting_iterator(x);
-            auto stride_counter = thrust::make_transform_iterator(expand_counter, _1 % stride);
-            auto direction_iter = thrust::make_transform_iterator(expand_counter, _1 / stride);
-
-            auto input_nodes_iter = thrust::make_permutation_iterator(input.nodes.begin(), stride_counter);
-            auto input_steps_iter = thrust::make_permutation_iterator(input.steps.begin(), stride_counter);
-
-            return thrust::make_zip_iterator(
-                    input_nodes_iter,
-                    input_steps_iter,
-                    direction_iter,
-                    output.nodes.begin() + x,
-                    output.steps.begin() + x,
-                    output.scores.begin() + x,
-                    output.parents.begin() + x
-            );
-        }
-
-        static auto make_select_iter(
-                const States& control,
-                const States& test,
-                States& output,
-                size_t x = 0
-        ) {
-            return thrust::make_zip_iterator(
-                    control.scores.begin() + x,
-                    test.nodes.begin() + x,
-                    test.steps.begin() + x,
-                    test.scores.begin() + x,
-                    test.parents.begin() + x,
-                    output.nodes.begin() + x,
-                    output.steps.begin() + x,
-                    output.scores.begin() + x,
-                    output.parents.begin() + x
             );
         }
 
