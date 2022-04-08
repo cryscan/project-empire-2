@@ -273,11 +273,13 @@ int main() {
     HashInsert hash_insert(thrust::raw_pointer_cast(hashtable.data()), hashtable.size());
 
     States open, extract, expand, dedup;
-    // thrust::device_vector<Node> indices;
+    thrust::device_vector<int> keys, indices;
 
     size_t expand_stride = 1024;
 
     open.reserve(4096);
+    keys.reserve(expand_stride);
+    indices.reserve(expand_stride);
     // close.reserve(4096);
     // merge.reserve(4096);
 
@@ -297,8 +299,8 @@ int main() {
         {
             // Extract.
             if (open.size() > expand_stride) {
-                thrust::device_vector<int> keys(stride);
-                thrust::device_vector<int> indices(stride);
+                keys.resize(stride);
+                indices.resize(stride);
                 thrust::reduce_by_key(
                         make_extract_keys(open.size(), stride),
                         make_extract_keys(open.size(), stride, open.size()),
