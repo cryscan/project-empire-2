@@ -130,11 +130,11 @@ struct StateSelect {
     }
 };
 
-struct StatePartition {
+struct StateRemove {
     template<typename Tuple>
     __host__ __device__
     bool operator()(const Tuple& tuple) {
-        return thrust::get<0>(tuple) != 0;
+        return thrust::get<0>(tuple) == 0;
     }
 };
 
@@ -188,7 +188,7 @@ void print_node(Node node) {
 
 int main() {
     Node start = 0xFEDCBA9876543210;
-    Node target = 0xAECDF941B8527306;
+    Node target = 0xAECDF941B8520736;
     Expansion expansion(target);
 
     States open, close, merge, expand, dedup;
@@ -258,7 +258,7 @@ int main() {
                     make_selection_iter(indices, close, dedup, dedup.size()),
                     thrust::make_zip_function(StateSelect())
             );
-            auto end = thrust::stable_partition(dedup.iter(), dedup.iter(dedup.size()), StatePartition());
+            auto end = thrust::remove_if(dedup.iter(), dedup.iter(dedup.size()), StateRemove());
             dedup.resize(end - dedup.iter());
         }
 
