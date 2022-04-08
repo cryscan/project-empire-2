@@ -8,15 +8,15 @@
 #include <thrust/device_vector.h>
 
 namespace empire {
-    template<typename Node, typename Edge, typename Value>
+    template<typename Node, typename Path, typename Value>
     struct HostStates;
 
-    template<typename Node, typename Edge, typename Value>
+    template<typename Node, typename Path, typename Value>
     struct States {
         thrust::device_vector<Node> nodes;
         thrust::device_vector<Value> steps;
         thrust::device_vector<Value> scores;
-        thrust::device_vector<Edge> parents;
+        thrust::device_vector<Path> parents;
 
         [[nodiscard]] size_t size() const { return nodes.size(); }
 

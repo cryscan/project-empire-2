@@ -3,7 +3,7 @@ project(project_empire_2 CUDA)
 
 set(CMAKE_CUDA_STANDARD 20)
 
-add_executable(project_empire_2 main.cu)
+add_executable(project_empire_2 main.cu hash.h)
 
 set_target_properties(project_empire_2 PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON)

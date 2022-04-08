@@ -6,10 +6,13 @@
 #include <thrust/zip_function.h>
 #include <thrust/binary_search.h>
 
+#include <chrono>
+
 #include "states.h"
 
 using Node = uint64_t;
 using Value = uint8_t;
+using Path = uint64_t;
 enum Edge : uint8_t {
     NORTH = 0,
     EAST = 1,
@@ -17,8 +20,8 @@ enum Edge : uint8_t {
     WEST = 3,
 };
 
-using States = empire::States<Node, Edge, Value>;
-using HostStates = empire::HostStates<Node, Edge, Value>;
+using States = empire::States<Node, Path, Value>;
+using HostStates = empire::HostStates<Node, Path, Value>;
 
 struct Expansion {
     Node target;
@@ -44,11 +47,12 @@ struct Expansion {
     void operator()(
             const Node& node,
             const Value& step,
+            const Path& parent,
             const size_t& direction,
             Node& out_node,
             Value& out_step,
             Value& out_score,
-            Edge& out_parent
+            Path& out_parent
     ) const {
         Node mask = 0xf;
         int x = -1, y = -1;
@@ -65,7 +69,7 @@ struct Expansion {
             out_node = (node | (selected << 16)) ^ selected;
             out_step = step + 1;
             out_score = step + heuristic(node);
-            out_parent = SOUTH;
+            out_parent = parent | (direction << (2 * step));
             return;
         }
 
@@ -74,7 +78,7 @@ struct Expansion {
             out_node = (node | (selected >> 4)) ^ selected;
             out_step = step + 1;
             out_score = step + heuristic(node);
-            out_parent = WEST;
+            out_parent = parent | (direction << (2 * step));
             return;
         }
 
@@ -83,7 +87,7 @@ struct Expansion {
             out_node = (node | (selected >> 16)) ^ selected;
             out_step = step + 1;
             out_score = step + heuristic(node);
-            out_parent = NORTH;
+            out_parent = parent | (direction << (2 * step));
             return;
         }
 
@@ -92,7 +96,7 @@ struct Expansion {
             out_node = (node | (selected << 4)) ^ selected;
             out_step = step + 1;
             out_score = step + heuristic(node);
-            out_parent = EAST;
+            out_parent = parent | (direction << (2 * step));
             return;
         }
 
@@ -146,10 +150,12 @@ auto make_expand_iter(const States& input, States& output, size_t stride, size_t
 
     auto input_nodes_iter = thrust::make_permutation_iterator(input.nodes.begin(), stride_counter);
     auto input_steps_iter = thrust::make_permutation_iterator(input.steps.begin(), stride_counter);
+    auto input_parents_iter = thrust::make_permutation_iterator(input.parents.begin(), stride_counter);
 
     return thrust::make_zip_iterator(
             input_nodes_iter,
             input_steps_iter,
+            input_parents_iter,
             direction_iter,
             output.nodes.begin() + x,
             output.steps.begin() + x,
@@ -173,6 +179,57 @@ auto make_selection_iter(
     );
 }
 
+__host__ __device__
+uint32_t hash(Node node) {
+    uint64_t hash = node;
+    hash ^= hash >> 16;
+    hash *= 0x85ebca6b;
+    hash ^= hash >> 13;
+    hash *= 0xc2b2ae35;
+    hash ^= hash >> 16;
+    return hash;
+}
+
+struct HashStateRemove {
+    const uint64_t* table;
+    const size_t size;
+
+    HashStateRemove(const uint64_t* table, size_t size) : table(table), size(size) {}
+
+    template<typename Tuple>
+    __host__ __device__
+    bool operator()(const Tuple& tuple) {
+        Node node = thrust::get<0>(tuple);
+
+        auto signature = hash(node);
+        auto key = signature % size;
+        auto value = table[key];
+
+        if (value != 0 && (value >> 32) == signature) {
+            Value score = thrust::get<2>(tuple);
+            return Value(value) <= score;
+        }
+
+        return false;
+    }
+};
+
+struct HashInsert {
+    uint64_t* table;
+    const size_t size;
+
+    HashInsert(uint64_t* table, size_t size) : table(table), size(size) {}
+
+    __device__
+    void operator()(const Node& node, const Value& score) const {
+        uint64_t signature = hash(node);
+        auto key = signature % size;
+
+        uint64_t value = (signature << 32) | score;
+        atomicExch(table + key, value);
+    }
+};
+
 void print_node(Node node) {
     Node mask = 0xf;
     for (auto i = 0u; i < 4; ++i) {
@@ -188,31 +245,42 @@ void print_node(Node node) {
 
 int main() {
     Node start = 0xFEDCBA9876543210;
-    Node target = 0xAECDF941B8520736;
+    Node target = 0xAECDF941B8527306;
     Expansion expansion(target);
 
-    States open, close, merge, expand, dedup;
-    thrust::device_vector<Node> indices;
+    std::chrono::high_resolution_clock::duration
+            expand_duration(0),
+            dedup_duration(0),
+            close_duration(0),
+            open_duration(0);
+
+    thrust::device_vector<uint64_t> hashtable(16777213);
+    HashStateRemove hash_state_remove(thrust::raw_pointer_cast(hashtable.data()), hashtable.size());
+    HashInsert hash_insert(thrust::raw_pointer_cast(hashtable.data()), hashtable.size());
+
+    States open, merge, expand, dedup;
+    // thrust::device_vector<Node> indices;
+
     size_t expand_stride = 1024;
 
     open.reserve(4096);
-    close.reserve(4096);
+    // close.reserve(4096);
     merge.reserve(4096);
 
     expand.resize(expand_stride << 2);
     dedup.reserve(expand_stride << 2);
-    indices.reserve(expand_stride << 2);
+    // indices.reserve(expand_stride << 2);
 
     open.push_back(thrust::make_tuple(start, 0, expansion.heuristic(start), NORTH));
-    close = open;
+    // close = open;
 
-    int iterations = 0;
-    for (int i = 0;; ++i) {
+    int iterations;
+    for (iterations = 0;; ++iterations) {
         auto stride = std::min(expand_stride, open.size());
+        auto expand_size = stride * 4;
 
+        auto tic = std::chrono::high_resolution_clock::now();
         {
-            auto expand_size = stride * 4;
-
             thrust::for_each(
                     make_expand_iter(open, expand, stride),
                     make_expand_iter(open, expand, stride, expand_size),
@@ -226,22 +294,13 @@ int main() {
                     expand.values(),
                     NodeComp()
             );
-            // Reduce, first pass.
-            dedup.resize(expand_size);
-            thrust::reduce_by_key(
-                    expand.keys(),
-                    expand.keys(expand_size),
-                    expand.values(),
-                    dedup.keys(),
-                    dedup.values(),
-                    thrust::equal_to<Node>(),
-                    StateReduce()
-            );
-            auto expand_end = thrust::find(dedup.keys(), dedup.keys(expand_size), 0);
-            dedup.resize(expand_end - dedup.keys());
         }
+        auto toc = std::chrono::high_resolution_clock::now();
+        expand_duration += toc - tic;
 
+        tic = std::chrono::high_resolution_clock::now();
         {
+            /*
             // Search in close list
             indices.resize(dedup.size());
             thrust::lower_bound(
@@ -260,10 +319,32 @@ int main() {
             );
             auto end = thrust::remove_if(dedup.iter(), dedup.iter(dedup.size()), StateRemove());
             dedup.resize(end - dedup.iter());
-        }
+             */
 
+            // Reduce, first pass.
+            dedup.resize(expand_size);
+            thrust::reduce_by_key(
+                    expand.keys(),
+                    expand.keys(expand_size),
+                    expand.values(),
+                    dedup.keys(),
+                    dedup.values(),
+                    thrust::equal_to<Node>(),
+                    StateReduce()
+            );
+            auto expand_end = thrust::find(dedup.keys(), dedup.keys(expand_size), 0);
+            dedup.resize(expand_end - dedup.keys());
+
+            // Remove suboptimal states.
+            auto end = thrust::remove_if(dedup.iter(), dedup.iter(dedup.size()), hash_state_remove);
+            dedup.resize(end - dedup.iter());
+        }
+        toc = std::chrono::high_resolution_clock::now();
+        dedup_duration += toc - tic;
+
+        tic = std::chrono::high_resolution_clock::now();
         {
-            // Update close list.
+            /*
             // Close list is assumed to be sorted by node.
             merge.resize(close.size() + dedup.size());
             thrust::merge_by_key(
@@ -287,8 +368,23 @@ int main() {
                     StateReduce()
             );
             close.resize(ends.first - close.keys());
+             */
+
+            // Update hash table
+            thrust::for_each(
+                    thrust::make_zip_iterator(dedup.nodes.begin(), dedup.scores.begin()),
+                    thrust::make_zip_iterator(dedup.nodes.end(), dedup.scores.end()),
+                    thrust::make_zip_function(hash_insert)
+            );
+        }
+        toc = std::chrono::high_resolution_clock::now();
+        close_duration += toc - tic;
+
+        if (thrust::binary_search(dedup.keys(), dedup.keys(dedup.size()), target)) {
+            break;
         }
 
+        tic = std::chrono::high_resolution_clock::now();
         {
             // The open list is assumed to be sorted by score.
             // Sort the expanded list by score and merge with open list.
@@ -311,29 +407,27 @@ int main() {
             );
             thrust::swap(open, merge);
         }
-
-        if (thrust::binary_search(close.keys(), close.keys(open.size()), target)) {
-            iterations = i;
-            break;
-        }
+        toc = std::chrono::high_resolution_clock::now();
+        open_duration += toc - tic;
     }
 
-    HostStates host_open, host_close;
+    HostStates host_open, host_dedup;
     host_open.copy_from(open);
-    host_close.copy_from(close);
+    host_dedup.copy_from(dedup);
 
-    Node node = target;
+    auto iter = std::lower_bound(host_dedup.nodes.begin(), host_dedup.nodes.end(), target);
+    auto pos = iter - host_dedup.nodes.begin();
+    auto path = host_dedup.parents[pos];
+
+    auto step = 0;
+    auto node = start;
     while (true) {
-        auto iter = std::lower_bound(host_close.nodes.begin(), host_close.nodes.end(), node);
-        auto pos = iter - host_close.nodes.begin();
-        auto parent = host_close.parents[pos];
-        auto step = host_close.steps[pos];
-        auto score = host_close.scores[pos];
-
-        std::cout << (int) step << ' ' << (int) score << '\n';
+        std::cout << (int) step << ' ' << '\n';
         print_node(node);
 
-        if (node == start) break;
+        if (node == target) break;
+
+        Edge edge = (Edge) (path & 0b11);
 
         Node mask = 0xf;
         int x = -1, y = -1;
@@ -344,25 +438,40 @@ int main() {
                 break;
             }
         }
-        if (parent == NORTH && x > 0) {
+        if (edge == NORTH && x > 0) {
             auto selected = node & (mask >> 16);
             node = (node | (selected << 16)) ^ selected;
         }
-        if (parent == EAST && y < 3) {
+        if (edge == EAST && y < 3) {
             auto selected = node & (mask << 4);
             node = (node | (selected >> 4)) ^ selected;
         }
-        if (parent == SOUTH && x < 3) {
+        if (edge == SOUTH && x < 3) {
             auto selected = node & (mask << 16);
             node = (node | (selected >> 16)) ^ selected;
         }
-        if (parent == WEST && y > 0) {
+        if (edge == WEST && y > 0) {
             auto selected = node & (mask >> 4);
             node = (node | (selected << 4)) ^ selected;
         }
+
+        ++step;
+        path >>= 2;
     }
 
     std::cout << "Iterations: " << iterations << std::endl;
+    std::cout << "Expand duration: "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(expand_duration).count()
+              << '\n';
+    std::cout << "Dedup duration: "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(dedup_duration).count()
+              << '\n';
+    std::cout << "Close duration: "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(close_duration).count()
+              << '\n';
+    std::cout << "Open duration: "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(open_duration).count()
+              << '\n';
 
     return 0;
 }
