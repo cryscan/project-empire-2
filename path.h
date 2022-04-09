@@ -6,7 +6,7 @@
 #define PROJECT_EMPIRE_2_PATH_H
 
 namespace empire {
-    template<typename Edge, typename Value, size_t PATH_LEN = 64, size_t EDGE_LEN = 2>
+    template<typename Edge, typename Value, size_t PATH_LEN = 128, size_t EDGE_LEN = 2>
     struct Path {
         uint64_t data[PATH_LEN / 64];
 
@@ -23,8 +23,9 @@ namespace empire {
 
         __host__ __device__
         Path& operator=(const Path& other) {
-            for (auto i = 0; i < PATH_LEN / 64; ++i)
-                data[i] = other.data[i];
+            if (this != &other)
+                for (auto i = 0; i < PATH_LEN / 64; ++i)
+                    data[i] = other.data[i];
             return *this;
         }
 
@@ -42,7 +43,7 @@ namespace empire {
         }
 
         __host__ __device__
-        Edge find(Value step) const {
+        Edge get(Value step) const {
             auto loc = step * EDGE_LEN;
             auto datum = data[loc / 64] >> (loc % 64);
             return static_cast<Edge>(datum & mask);

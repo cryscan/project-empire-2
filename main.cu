@@ -56,6 +56,11 @@ struct Expansion {
             Value& out_score,
             Path& out_parent
     ) const {
+        if (node == 0) {
+            out_node = 0;
+            return;
+        }
+
         Node mask = 0xf;
         int x = -1, y = -1;
         for (int i = 0; i < 16; ++i, mask <<= 4) {
@@ -133,12 +138,11 @@ struct StateRemove {
     }
 };
 
-template<size_t INDEX>
-struct StatePartition {
-    template<typename Tuple>
+struct StateClear {
     __host__ __device__
-    bool operator()(const Tuple& tuple) {
-        return thrust::get<INDEX>(tuple) != 0;
+    void operator()(Node& node, Value& score) {
+        node = 0;
+        score = ~0;
     }
 };
 
@@ -289,7 +293,7 @@ int main() {
     dedup.reserve(expand_stride << 2);
     // indices.reserve(expand_stride << 2);
 
-    open.push_back(thrust::make_tuple(start, 0, expansion.heuristic(start), NORTH));
+    open.push_back(thrust::make_tuple(start, 0, expansion.heuristic(start), Path()));
     // close = open;
 
     int iterations;
@@ -313,17 +317,40 @@ int main() {
                 );
 
                 // Remove extracted states from open list.
+                auto iter_begin = thrust::make_permutation_iterator(
+                        thrust::make_zip_iterator(open.keys(), open.keys_score()),
+                        indices.begin()
+                );
+                auto iter_end = thrust::make_permutation_iterator(
+                        thrust::make_zip_iterator(open.keys(), open.keys_score()),
+                        indices.end()
+                );
+                thrust::for_each(iter_begin, iter_end, thrust::make_zip_function(StateClear()));
+
+                /*
                 using namespace thrust::placeholders;
                 thrust::transform(
-                        thrust::make_permutation_iterator(open.nodes.begin(), indices.begin()),
-                        thrust::make_permutation_iterator(open.nodes.begin(), indices.end()),
-                        thrust::make_permutation_iterator(open.nodes.begin(), indices.begin()),
+                        thrust::make_permutation_iterator(open.keys(), indices.begin()),
+                        thrust::make_permutation_iterator(open.keys(), indices.end()),
+                        thrust::make_permutation_iterator(open.keys(), indices.begin()),
                         _1 ^ _1
                 );
+                thrust::transform(
+                        thrust::make_permutation_iterator(open.keys_score(), indices.begin()),
+                        thrust::make_permutation_iterator(open.keys_score(), indices.end()),
+                        thrust::make_permutation_iterator(open.keys_score(), indices.begin()),
+                        ~(_1 ^ _1)
+                );
+                 */
 
-                auto end = thrust::remove_if(open.iter(), open.iter(open.size()), StateRemove<0>());
+                if (iterations % 200 == 0) {
+                    auto end = thrust::remove_if(open.iter(), open.iter(open.size()), StateRemove<0>());
+                    open.resize(end - open.iter());
+                }
+
+                // auto end = thrust::remove_if(open.iter(), open.iter(open.size()), StateRemove<0>());
                 // auto end = thrust::partition(open.iter(), open.iter(open.size()), StatePartition<0>());
-                open.resize(end - open.iter());
+                // open.resize(end - open.iter());
             } else {
                 extract = open;
                 open.resize(0);
@@ -414,13 +441,13 @@ int main() {
 
     auto step = 0;
     auto node = start;
-    while (true) {
+    while (step <= host_dedup.steps[pos]) {
         std::cout << (int) step << ' ' << '\n';
         print_node(node);
 
         if (node == target) break;
 
-        Edge edge = (Edge) (path & 0b11);
+        Edge edge = static_cast<Edge>((path >> (2 * step)) & 0b11);
 
         Node mask = 0xf;
         int x = -1, y = -1;
@@ -449,7 +476,6 @@ int main() {
         }
 
         ++step;
-        path >>= 2;
     }
 
     std::cout << "Iterations: " << iterations << std::endl;
