@@ -10,6 +10,7 @@
 #include <chrono>
 
 #include "states.h"
+#include "path.h"
 
 using Node = uint64_t;
 using Value = uint8_t;
